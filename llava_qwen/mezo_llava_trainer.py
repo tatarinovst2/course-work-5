@@ -249,9 +249,19 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
         return self.zo_eps
 
+    ########################
+    # Override Methods
+    ########################
+
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
+        if args is None:
+            args = self.args
+
+        # report_memory("Before Training Loop")
+
+        # Start of existing training loop setup
         self.accelerator.free_memory()
         self._train_batch_size = batch_size
         if self.args.auto_find_batch_size:
@@ -261,7 +271,7 @@ class MeZOLLaVATrainer(LLaVATrainer):
                 (self.model_wrapped,) = release_memory(self.model_wrapped)
                 self.model_wrapped = self.model
 
-                # Check for DeepSpeed *after* the intial pass and modify the config
+                # Check for DeepSpeed *after* the initial pass and modify the config
                 if self.is_deepspeed_enabled:
                     # Temporarily unset `self.args.train_batch_size`
                     original_bs = self.args.per_device_train_batch_size
@@ -334,17 +344,19 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
         delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled
 
-        # We need to reset the scheduler, as its parameters may be different on subsequent calls
+        # Reset the scheduler if it was created
         if self._created_lr_scheduler:
             self.lr_scheduler = None
             self._created_lr_scheduler = False
 
+        # Initialize optimizer and scheduler
         if self.is_deepspeed_enabled:
             self.optimizer, self.lr_scheduler = deepspeed_init(self, num_training_steps=max_steps)
 
         if not delay_optimizer_creation:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
+        # Initialize training state
         self.state = TrainerState()
         self.state.is_hyper_param_search = trial is not None
         self.state.train_batch_size = self._train_batch_size
@@ -430,7 +442,7 @@ class MeZOLLaVATrainer(LLaVATrainer):
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model),
         # FSDP(Transformers Model), Dynamo Optimized Module(Transformers Model) etc.
 
-        # Train!
+        # Logging
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {num_examples:,}")
         logger.info(f"  Num Epochs = {num_train_epochs:,}")
@@ -442,6 +454,7 @@ class MeZOLLaVATrainer(LLaVATrainer):
         logger.info(f"  Total optimization steps = {max_steps:,}")
         logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
 
+        # Initialize training variables
         self.state.epoch = 0
         start_time = time.time()
         epochs_trained = 0
@@ -585,13 +598,29 @@ class MeZOLLaVATrainer(LLaVATrainer):
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                with self.accelerator.accumulate(model):
-                    tr_loss_step = self.training_step(model, inputs)
+                ########################
+                # MeZO Integration
+                ########################
+                if self.trainer_mode == "zo":
+                    # Perform MeZO step
+                    tr_loss_step = self.zo_step(model, inputs)
+                    print(f"Step {step} loss: {tr_loss_step}")
+                else:
+                    # Regular training step with gradient accumulation
+                    with self.accelerator.accumulate(model):
+                        tr_loss_step = self.training_step(model, inputs)
+                        print(f"Step {step} loss: {tr_loss_step}")
+                # report_memory("After Training Step")
 
+                ########################
+                # End of MeZO Integration
+                ########################
+
+                # Accumulate loss
                 if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_xla_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                        args.logging_nan_inf_filter
+                        and not is_torch_xla_available()
+                        and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
                 ):
                     # if loss is nan or inf simply add the average of previous logged losses
                     tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
@@ -610,53 +639,63 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
                 if (
                     total_batched_samples % args.gradient_accumulation_steps == 0
-                    or
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    is_last_step_and_steps_less_than_grad_acc
+                    or is_last_step_and_steps_less_than_grad_acc
                 ):
-                    # the `or` condition of `is_last_step_and_steps_less_than_grad_acc` is not covered
-                    # in accelerate. So, explicitly enable sync gradients to True in that case.
-                    if is_last_step_and_steps_less_than_grad_acc:
-                        self.accelerator.gradient_state._set_sync_gradients(True)
+                    ########################
+                    # MeZO Integration
+                    ########################
+                    if self.trainer_mode == "zo":
+                        self.zo_update(learning_rate=self._get_learning_rate())
+                        self.lr_scheduler.step()
+                        # report_memory("After MeZO update")
+                    ########################
+                    # End of MeZO Integration
+                    ########################
+                    else:
+                        # the `or` condition of `is_last_step_and_steps_less_than_grad_acc` is not covered
+                        # in accelerate. So, explicitly enable sync gradients to True in that case.
+                        if is_last_step_and_steps_less_than_grad_acc:
+                            self.accelerator.gradient_state._set_sync_gradients(True)
 
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                        # deepspeed does its own clipping
+                        # Gradient clipping
+                        if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                            # deepspeed does its own clipping
 
-                        if is_sagemaker_mp_enabled() and args.fp16:
-                            _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
-                        elif self.use_apex:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            _grad_norm = nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer),
-                                args.max_grad_norm,
-                            )
-                        else:
-                            _grad_norm = self.accelerator.clip_grad_norm_(
-                                model.parameters(),
-                                args.max_grad_norm,
-                            )
+                            if is_sagemaker_mp_enabled() and args.fp16:
+                                _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
+                            elif self.use_apex:
+                                # Revert to normal clipping otherwise, handling Apex or full precision
+                                _grad_norm = nn.utils.clip_grad_norm_(
+                                    amp.master_params(self.optimizer),
+                                    args.max_grad_norm,
+                                )
+                            else:
+                                _grad_norm = self.accelerator.clip_grad_norm_(
+                                    model.parameters(),
+                                    args.max_grad_norm,
+                                )
 
-                        if (
-                            is_accelerate_available()
-                            and self.accelerator.distributed_type == DistributedType.DEEPSPEED
-                        ):
-                            grad_norm = model.get_global_grad_norm()
-                            # In some cases the grad norm may not return a float
-                            if hasattr(grad_norm, "item"):
-                                grad_norm = grad_norm.item()
-                        else:
-                            grad_norm = _grad_norm
+                            if (
+                                    is_accelerate_available()
+                                    and self.accelerator.distributed_type == DistributedType.DEEPSPEED
+                            ):
+                                grad_norm = model.get_global_grad_norm()
+                                # In some cases the grad norm may not return a float
+                                if hasattr(grad_norm, "item"):
+                                    grad_norm = grad_norm.item()
+                            else:
+                                grad_norm = _grad_norm
 
-                    # Optimizer step
-                    self.optimizer.step()
-                    optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
-                    if optimizer_was_run:
-                        # Delay optimizer scheduling until metrics are generated
-                        if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                            self.lr_scheduler.step()
+                        # Optimizer step
+                        self.optimizer.step()
+                        optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
+                        if optimizer_was_run:
+                            # Delay optimizer scheduling until metrics are generated
+                            if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                                self.lr_scheduler.step()
 
-                    model.zero_grad()
+                        model.zero_grad()
+
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
@@ -666,12 +705,10 @@ class MeZOLLaVATrainer(LLaVATrainer):
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
-                    # PyTorch/XLA relies on the data loader to insert the mark_step for
-                    # each step. Since we are breaking the loop early, we need to manually
-                    # insert the mark_step here.
                     if is_torch_xla_available():
                         xm.mark_step()
                     break
+
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
@@ -711,7 +748,7 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
             self._load_best_model()
 
-        # add remaining tr_loss
+        # Add remaining tr_loss
         self._total_loss_scalar += tr_loss.item()
         effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
         train_loss = self._total_loss_scalar / effective_global_step
@@ -752,5 +789,11 @@ class MeZOLLaVATrainer(LLaVATrainer):
         # for the embedding layer by removing the forward post hook.
         if self.neftune_noise_alpha is not None:
             self._deactivate_neftune(self.model)
+
+        plot_graphs_based_on_log_history(
+            log_history=self.state.log_history,
+            output_dir=run_dir,
+            metrics=["train_loss"],
+        )
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
