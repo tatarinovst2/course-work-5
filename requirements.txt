@@ -1,0 +1,14 @@
+git+https://github.com/LLaVA-VL/LLaVA-NeXT.git
+accelerate==0.29.3
+datasets==3.3.2
+deepspeed==0.14.5
+einops==0.6.1
+open-clip-torch==2.24.0
+matplotlib==3.10.1
+numpy==1.26.4
+peft==0.4.0
+pyqt6==6.8.1
+torch==2.1.2
+torchvision==0.16.2
+transformers==4.40.0
+tyro==0.8.3
