@@ -615,9 +615,9 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
                 # Accumulate loss
                 if (
-                        args.logging_nan_inf_filter
-                        and not is_torch_xla_available()
-                        and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    args.logging_nan_inf_filter
+                    and not is_torch_xla_available()
+                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
                 ):
                     # if loss is nan or inf simply add the average of previous logged losses
                     tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
@@ -710,7 +710,6 @@ class MeZOLLaVATrainer(LLaVATrainer):
                     if is_torch_xla_available():
                         xm.mark_step()
                     break
-
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
@@ -750,7 +749,7 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
             self._load_best_model()
 
-        # Add remaining tr_loss
+        # add remaining tr_loss
         self._total_loss_scalar += tr_loss.item()
         effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
         train_loss = self._total_loss_scalar / effective_global_step

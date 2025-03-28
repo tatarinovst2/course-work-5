@@ -12,4 +12,4 @@ pymarkdownlnt==0.9.29
 pymdown-extensions==10.14.3
 pyspelling==2.1.0
 pytest==8.3.5
-types-tqdm==4.67.0
+types-tqdm==4.67.0.20250319
