@@ -344,19 +344,17 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
         delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled
 
-        # Reset the scheduler if it was created
+        # We need to reset the scheduler, as its parameters may be different on subsequent calls
         if self._created_lr_scheduler:
             self.lr_scheduler = None
             self._created_lr_scheduler = False
 
-        # Initialize optimizer and scheduler
         if self.is_deepspeed_enabled:
             self.optimizer, self.lr_scheduler = deepspeed_init(self, num_training_steps=max_steps)
 
         if not delay_optimizer_creation:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
-        # Initialize training state
         self.state = TrainerState()
         self.state.is_hyper_param_search = trial is not None
         self.state.train_batch_size = self._train_batch_size
@@ -442,7 +440,7 @@ class MeZOLLaVATrainer(LLaVATrainer):
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model),
         # FSDP(Transformers Model), Dynamo Optimized Module(Transformers Model) etc.
 
-        # Logging
+        # Train!
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {num_examples:,}")
         logger.info(f"  Num Epochs = {num_train_epochs:,}")
@@ -454,7 +452,6 @@ class MeZOLLaVATrainer(LLaVATrainer):
         logger.info(f"  Total optimization steps = {max_steps:,}")
         logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
 
-        # Initialize training variables
         self.state.epoch = 0
         start_time = time.time()
         epochs_trained = 0
@@ -639,7 +636,9 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
                 if (
                     total_batched_samples % args.gradient_accumulation_steps == 0
-                    or is_last_step_and_steps_less_than_grad_acc
+                    or
+                    # last step in epoch but step is always smaller than gradient_accumulation_steps
+                    is_last_step_and_steps_less_than_grad_acc
                 ):
                     ########################
                     # MeZO Integration
@@ -705,6 +704,9 @@ class MeZOLLaVATrainer(LLaVATrainer):
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
+                    # PyTorch/XLA relies on the data loader to insert the mark_step for
+                    # each step. Since we are breaking the loop early, we need to manually
+                    # insert the mark_step here.
                     if is_torch_xla_available():
                         xm.mark_step()
                     break
