@@ -138,7 +138,7 @@ class MeZOLLaVATrainer(LLaVATrainer):
         print(f"Trainable parameters amount: {len(self.trainable_params)}")
 
         if not self.trainable_params:
-            raise ValueError("No trainable parameters found. Ensure the model has a trainable head or similar.")
+            raise ValueError("No trainable parameters found.")
 
         if self.trainer_mode == "zo":
             for param in self.model.parameters():

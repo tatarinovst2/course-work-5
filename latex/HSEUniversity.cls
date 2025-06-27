@@ -4,13 +4,13 @@
 \LoadClass[fontsize=14bp]{scrreprt}
 \RequirePackage{ifpdf}
 \RequirePackage{kvoptions}
-\RequirePackage[a4paper,left=25mm,right=10mm,top=20mm,bottom=25mm,footskip=10mm]{geometry}
+\RequirePackage[a4paper,left=30mm,right=10mm,top=20mm,bottom=20mm,footskip=10mm]{geometry}
 
 % \RequirePackage{cmap}						% Улучшенный поиск русских слов в полученном pdf-файле
 \RequirePackage[T2A]{fontenc}				% Поддержка русских букв
 % \RequirePackage[utf8]{inputenc}				% Кодировка utf8
-% \RequirePackage{csquotes}
-\RequirePackage[russian]{babel}	% Языки: русский, английский
+\RequirePackage{csquotes}
+\RequirePackage[english,russian]{babel}	% Языки: русский, английский
 
 \usepackage{fontspec}
 \usepackage{polyglossia}
@@ -20,6 +20,35 @@
 \newfontfamily\cyrillicfont{Times New Roman}[Script=Cyrillic]
 \newfontfamily{\cyrillicfonttt}{Times New Roman}
 \setmainlanguage{russian}
+
+% My code
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{float} % Позволяет расположить таблицу именно там, где она назодится относительно текста
+\usepackage{enumitem}
+\usepackage{subfig}  % Для горизонтально расположенных графиков
+\usepackage{chngcntr}  % Нумерует графики и таблицы без учёта глав
+\counterwithout{table}{chapter}
+\counterwithout{figure}{chapter}
+\counterwithout{equation}{chapter}
+%\setcounter{tocdepth}{4}
+\setcounter{secnumdepth}{4}
+\setlist[itemize]{left=13mm, topsep=0pt, partopsep=0pt, itemsep=0pt, parsep=0pt}
+\setlist[enumerate]{left=13mm, topsep=0pt, partopsep=0pt, itemsep=0pt, parsep=0pt}
+\renewcommand\thesubfigure{\asbuk{subfigure}}
+
+\usepackage{tikz}
+\usetikzlibrary{positioning, shadows, arrows.meta, shapes, calc}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pgfplots}
+\usepackage{booktabs}
+
+
+% PATCH FIX
+\define@key{blx@opt@pre}{dropdates}[true]{}
+% PATCH FIX
+% ----
 
 \RequirePackage[font=small,skip=4pt]{caption}
 \RequirePackage{graphicx}
@@ -35,6 +64,10 @@
 \RequirePackage{titlesec}
 
 %%% Table of Contents %%%
+% PATCH FIX
+\let\c@lofdepth\relax
+\let\c@lotdepth\relax
+% PATCH FIX
 \RequirePackage{tocloft}
 \RequirePackage{titletoc}
 
@@ -43,25 +76,56 @@
 \RequirePackage{amssymb}
 
 
-\RequirePackage[linktocpage=true,plainpages=false,pdfpagelabels=false]{hyperref}
+\RequirePackage[linktocpage=true,plainpages=false,pdfpagelabels=false,hidelinks]{hyperref}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% Библиография %%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \RequirePackage[
-	style=gost-numeric-min,
+	bibstyle=gost-numeric-min,
+%	citestyle=gost-authoryear-min,
+	citestyle=gost-numeric-min,
+%	citestyle=authoryear,
+%    bibstyle=gost-numeric-min,
 	language=russian,
 	babel=other,
 	backend=biber,
-	defernumbers=true,% Нумерация начинается как только встречается группа.
+%	defernumbers=true,% Нумерация начинается как только встречается группа.
 	sorting=none,
 	url=false,
 	doi=false,
 	isbn=false,
 	movenames=false,
-	maxnames=100
+	maxcitenames=2,
+	maxbibnames=10
 ]{biblatex}
+
+\DefineBibliographyStrings{english}{
+  andothers = {et al.},
+}
+\DefineBibliographyStrings{russian}{
+%  andothers = {и др.},
+  andothers = {et al.},
+}
+
 \renewcommand*{\multicitedelim}{\addcomma\space}
+
+%\DeclareCiteCommand{\cite}
+%  {\usebibmacro{prenote}}
+%  {\usebibmacro{citeindex}%
+%   \printtext[bibhyperref]{%
+%	 (\printnames{labelname}%
+%     \setunit{\nameyeardelim},%
+%     \printfield{year}})}
+%  {\multicitedelim}
+%  {\usebibmacro{postnote}}
+
+\DeclareCiteCommand{\citeurl}
+  {\usebibmacro{prenote}}
+  {\usebibmacro{citeindex}%
+   \printtext{(\printfield{url})}}
+  {}
+  {\usebibmacro{postnote}}
 
 %\usepackage{cite} % Красивые ссылки на литературу
 % Настройки языка в списке литературы.
@@ -104,24 +168,25 @@
 \linespread{1.5} % Полуторный интервал
 \setlength{\parindent}{12.5mm} % Отступ красной строки
 
-\captionsetup[table]{position=t,singlelinecheck=false, justification=RaggedLeft,labelsep=period}
-\captionsetup[figure]{labelfont={bf},textfont={bf},position=b,singlelinecheck=false,labelsep=period,justification=centering}
+\captionsetup[table]{position=t,singlelinecheck=false, justification=RaggedLeft,labelsep=space}  % labelsep=period
+%\captionsetup[figure]{labelfont={bf},textfont={bf},position=b,singlelinecheck=false,labelsep=space,justification=centering}  % labelsep=period
+\captionsetup[figure]{position=b,singlelinecheck=false,labelsep=space,justification=centering}
 
 %%% Главы и разделы %%%
 \titleformat{\chapter}%[display]
-  {\Large\bfseries\centering}
+  {\large\bfseries\centering}  % {\Large\bfseries\centering}
   {\chaptertitlename\ \thechapter.}{4pt}{}
 \titlespacing*{\chapter}{0pt}{0pt}{12pt}
 \titleformat{\section}
-  {\large\centering}
+  {\large\bfseries\centering}  % {\large\centering}
   {\thesection.}{4pt}{}
 \titlespacing*{\section}{0pt}{12pt}{6pt}
 \titleformat{\subsection}
-  {\centering}
+  {\bfseries\centering} % {\centering}
   {\thesubsection.}{3pt}{}
 \titlespacing*{\subsection}{0pt}{8pt}{4pt}
 \titleformat{\subsubsection}
-  {\centering}
+  {\bfseries\centering} % {\centering}
   {\thesubsubsection.}{3pt}{}
 \titlespacing*{\subsubsection}{0pt}{8pt}{4pt}
 
@@ -144,9 +209,9 @@
 \titlecontents{chapter}% <section-type>
   [0pt]% <left>
   {}% <above-code>
-  {\bfseries\chaptername\ \thecontentslabel.\enskip}% <numbered-entry-format>
+  {\chaptername\ \thecontentslabel.\enskip}% <numbered-entry-format> {\bfseries\chaptername\ \thecontentslabel.\enskip}
   {}% <numberless-entry-format>
-  {\bfseries\dotfill\contentspage}% <filler-page-format>
+  {\dotfill\contentspage}% <filler-page-format> {\bfseries\dotfill\contentspage}
 %%%%%%%%%%%%%%%%%%%%%%%%
 % Обработка опций пакета
 
@@ -161,13 +226,15 @@
 \def\@specCode{00.00.00.UNKOWN SPECIALIZATION}
 \newif\ifHasReviewer
 \HasReviewerfalse
+\newif\ifHasConsultant
+\HasConsultantfalse
 
 % Available options for the specialiazation
 % LI -- Фундаментальная и прикладная лингвистика
 \DeclareVoidOption{LI}{
-	\def\@facultyString{Факультет гуманитарных наук}
-	\def\@specName{Фундаментальная и прикладная лингвистика}
-	\def\@specCode{45.03.03. Фундаментальная и прикладная лингвистика}
+	\def\@facultyString{Факультет информатики, математики и компьютерных наук}
+	\def\@specName{Интеллектуальный анализ данных}
+	\def\@specCode{01.04.02 Прикладная математика и информатика}
 }
 % Available options for the type
 \DeclareVoidOption{KR}{
@@ -175,7 +242,6 @@
 }
 \DeclareVoidOption{VKR}{
 	\def\@typeString{Выпускная квалификационная работа}
-	\HasReviewertrue
 }
 
 \DeclareDefaultOption{%
@@ -203,6 +269,10 @@
 	\def\@supervisorTitle{#1}
 	\def\@supervisorName{#2}
 }
+\newcommand{\consultant}[2]{
+	\def\@consultantTitle{#1}
+	\def\@consultantName{#2}
+}
 \newcommand{\reviewer}[2]{
 	\def\@reviewerTitle{#1}
 	\def\@reviewerName{#2}
@@ -210,6 +280,83 @@
 \newcommand{\Abstract}[1]{
 	\def\@abstract{#1}
 }
+
+%\renewcommand{\maketitle}{
+%{
+%	\thispagestyle{empty}
+%
+%	\centering
+%
+%	{
+%		ФЕДЕРАЛЬНОЕ ГОСУДАРСТВЕННОЕ АВТОНОМНОЕ \\
+%		ОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ВЫСШЕГО ОБРАЗОВАНИЯ \\
+%		«НАЦИОНАЛЬНЫЙ ИССЛЕДОВАТЕЛЬСКИЙ УНИВЕРСИТЕТ \\
+%		«ВЫСШАЯ ШКОЛА ЭКОНОМИКИ»
+%	}
+%
+%	\vfill
+%	\vfill
+%
+%	\textbf{\@facultyString}
+%
+%	\vfill
+%
+%	\textbf{Программа подготовки магистров по направлению \\
+%  	\@specCode}
+%
+%	\vfill
+%	\vfill
+%
+%	\@author
+%
+%	\textbf{\MakeUppercase{\@typeString}}
+%
+%	\vfill
+%
+%	\@title
+%
+%	\vfill
+%	\vfill
+%	\vfill
+%
+%	\ifHasReviewer
+%		\begin{minipage}[t]{0.4\textwidth}
+%			Рецензент \\
+%			\@reviewerTitle
+%
+%			\vspace{2mm}
+%
+%			\@reviewerName
+%		\end{minipage}
+%	\fi
+%	\hfill
+%	\begin{minipage}[t]{0.4\textwidth}
+%		Руководитель \\
+%		\@supervisorTitle
+%
+%		\@supervisorName
+%	\end{minipage}
+%
+%	\vspace{10mm}
+%
+%	\ifHasConsultant
+%		\hfill
+%		\begin{minipage}[t]{0.4\textwidth}
+%			Научный консультант \\
+%			\@consultantTitle
+%
+%			\@consultantName
+%		\end{minipage}
+%	\fi
+%
+%	\vfill
+%	\vfill
+%	\vfill
+%
+%	\@city{}, \@year{}
+%
+%	\newpage
+%}
 
 \renewcommand{\maketitle}{
 {
@@ -219,8 +366,8 @@
 
 	{
 		ФЕДЕРАЛЬНОЕ ГОСУДАРСТВЕННОЕ АВТОНОМНОЕ \\
-		ОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ВЫСШЕГО ОБРАЗОВАНИЯ \\ 
-		«НАЦИОНАЛЬНЫЙ ИССЛЕДОВАТЕЛЬСКИЙ УНИВЕРСИТЕТ \\ 
+		ОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ВЫСШЕГО ОБРАЗОВАНИЯ \\
+		«НАЦИОНАЛЬНЫЙ ИССЛЕДОВАТЕЛЬСКИЙ УНИВЕРСИТЕТ \\
 		«ВЫСШАЯ ШКОЛА ЭКОНОМИКИ»
 	}
 
@@ -238,8 +385,10 @@
 
 	\textit{\@typeString}
 
-	% студента образовательной программы <<\@specName>> \\
-  по направлению подготовки \textit{\underline{\@specCode}}
+	по направлению подготовки \textit{\underline{\@specCode}} \\
+	образовательная программа  \\
+	«\@specName»
+
 
 	\vfill
 	\vfill
@@ -272,9 +421,9 @@
 	\newpage
 }
 
-\chapter**{Аннотация}
+%\chapter**{Аннотация}
 
-\@abstract
+%\@abstract
 
 \chapter**{Оглавление}
 
@@ -316,4 +465,23 @@
 
   \caption{\@figureCaption}
   \end{figure}
+}
+
+\def\cyrtoc#1{\ifcase #1\or А\or Б\or В\or Г\or Д\or Е\or Ж\or И\or К\or Л\or М\or Н\or П\or Р\or С\or Т\or У\or Ф\or Х\or Ц\or Ш\or Щ\or Э\or Ю\or Я\else \@ctrerr \fi}
+
+\newcommand\originalappendix{}
+\let\originalappendix\appendix
+\renewcommand{\appendix}{%
+  \label{pg:end} % для указания на номер последней страницы
+  \originalappendix
+  \renewcommand{\thechapter}{\cyrtoc{\value{chapter}}}
+  \renewcommand{\appendixname}{Приложение} % Можно не менять и заменить на команду с \MakeUppercase в \renewcommand у меня локально не компилит, а в overleaf все нормально
+%  \titleformat{\chapter}{\Large\bfseries\centering}{\MakeUppercase{\chaptertitlename}\ \thechapter}{4pt}{}
+%    \titleformat{\chapter}{\Large\bfseries\centering}\chaptertitlename\ \thechapter}{4pt}{}
+
+  \addtocontents{toc}{\protect\value{tocdepth}=\chaptertocdepth}
+  \renewcommand\addchaptertocentry[2]{%
+    \addtocentrydefault{chapter}{}{\appendixname~##1 ##2}
+    % \addtocentrydefault{chapter}{}{\MakeUppercase{\appendixname~##1} ##2}
+  }
 }
