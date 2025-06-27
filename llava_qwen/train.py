@@ -36,7 +36,6 @@ import transformers
 import tokenizers
 from huggingface_hub import hf_hub_download
 
-from utils import monitor
 from mezo_llava_trainer import MeZOLLaVATrainer, MeZOTrainingArguments
 from zo_adamu_llava_trainer import ZOAdaMULLaVATrainer
 
@@ -380,18 +379,6 @@ def setup_gradient_checkpointing(model, training_args):
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
 
-@dataclass
-class MonitoringArguments:
-    enable_monitoring: bool = field(
-        default=False,
-        metadata={"help": "Enable GPU memory monitoring during training."}
-    )
-    monitor_interval: float = field(
-        default=5.0,
-        metadata={"help": "Interval (in seconds) between GPU memory usage checks (default: 5 seconds)."}
-    )
-
-
 def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False) -> Dict:
     # ONLY USING QWEN VERSION HERE
     return preprocess_qwen(sources, tokenizer, has_image=has_image)
@@ -600,17 +587,16 @@ class UTF8LazySupervisedDataset(LazySupervisedDataset):
 
 def train():
     # Initialize HfArgumentParser with all relevant dataclasses
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, MeZOTrainingArguments, MonitoringArguments))
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, MeZOTrainingArguments))
 
     # Parse all arguments into their respective dataclasses
-    model_args, data_args, training_args, monitoring_args = parser.parse_args_into_dataclasses()
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     if training_args.verbose_logging:
         print(f"Inspecting experiment hyperparameters:\n")
         print(f"model_args = {vars(model_args)}\n")
         print(f"data_args = {vars(data_args)}\n")
         print(f"training_args = {vars(training_args)}\n")
-        print(f"monitoring_args = {vars(monitoring_args)}\n")
         # If evaluation_args exist
         # print(f"evaluation_args = {vars(evaluation_args)}\n")
 
@@ -639,13 +625,6 @@ def train():
     else:
         trainer = MeZOLLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
-    monitor_process = None
-    if monitoring_args.enable_monitoring:
-        print("Monitoring is enabled. Starting GPU memory monitor...")
-        current_pid = os.getpid()
-        monitor_process = Process(target=monitor, args=(current_pid, monitoring_args.monitor_interval))
-        monitor_process.start()
-
     try:
         if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
             trainer.train(resume_from_checkpoint=True)
@@ -654,11 +633,6 @@ def train():
         trainer.save_state()
     except KeyboardInterrupt:
         print("Training interrupted by user. Saving model...")
-    finally:
-        if monitor_process and monitor_process.is_alive():
-            print("Training completed. Terminating GPU memory monitor...")
-            monitor_process.terminate()
-            monitor_process.join()
 
     print("Max GPU memory usage during training:")
     print(f"{torch.cuda.max_memory_allocated() / (1024 ** 3):.2f} GB")
