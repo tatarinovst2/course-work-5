@@ -15,8 +15,18 @@
 #    limitations under the License.
 
 import ast
+import copy
+import json
+import math
 import pathlib
-from PIL import ImageFile
+import random
+from dataclasses import dataclass, field
+from multiprocessing import Process
+from typing import Dict, Sequence
+
+import numpy as np
+import yaml
+from PIL import Image, ImageFile
 from packaging import version
 
 import re
@@ -24,11 +34,16 @@ import torch
 
 import transformers
 import tokenizers
+from huggingface_hub import hf_hub_download
 
+from utils import monitor
 from mezo_llava_trainer import MeZOLLaVATrainer, MeZOTrainingArguments
+from zo_adamu_llava_trainer import ZOAdaMULLaVATrainer
 
 from llava import conversation as conversation_lib
+from llava.constants import DEFAULT_IMAGE_TOKEN
 from llava.model import *
+from llava.utils import process_video_with_decord
 
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -45,8 +60,9 @@ from llava.train.train import (
     find_all_linear_names,
     safe_save_model_for_hf_trainer,
     smart_tokenizer_and_embedding_resize,
-    get_model,
-    make_supervised_data_module,
+    get_model, preprocess_multimodal, preprocess_qwen,
+    # make_supervised_data_module, LazySupervisedDataset, DataCollatorForSupervisedDataset,
+    LazySupervisedDataset, DataCollatorForSupervisedDataset,
 )
 
 
@@ -102,7 +118,7 @@ def setup_tokenizer(model_args, training_args, model):
         if tokenizer.unk_token is not None:
             tokenizer.pad_token = tokenizer.unk_token
         if model_args.version in conversation_lib.conv_templates:
-            conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
+            conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]  # KEEP IN MIND: Change would not be reflected in the dataset
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
@@ -364,15 +380,237 @@ def setup_gradient_checkpointing(model, training_args):
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
 
+@dataclass
+class MonitoringArguments:
+    enable_monitoring: bool = field(
+        default=False,
+        metadata={"help": "Enable GPU memory monitoring during training."}
+    )
+    monitor_interval: float = field(
+        default=5.0,
+        metadata={"help": "Interval (in seconds) between GPU memory usage checks (default: 5 seconds)."}
+    )
+
+
+def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False) -> Dict:
+    # ONLY USING QWEN VERSION HERE
+    return preprocess_qwen(sources, tokenizer, has_image=has_image)
+
+
+def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    train_dataset = UTF8LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+
+from torch.utils.data import Dataset
+class UTF8LazySupervisedDataset(LazySupervisedDataset):
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments):
+        Dataset.__init__(self)
+        self.tokenizer = tokenizer
+        self.list_data_dict = []
+
+        # Handle multiple JSON files specified in the data_path
+        if "{" in data_path and "}" in data_path:
+            base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
+            file_names = file_pattern.split(",")
+            print(f"Loading {file_names} from {base_path}")
+            data_args.dataset_paths = []
+            for file_name in file_names:
+                data_args.dataset_paths.append(f"{base_path}{file_name}.json")
+                full_path = f"{base_path}{file_name}.json"
+                print(f"Loading {full_path}")
+                with open(full_path, "r") as file:
+                    cur_data_dict = json.load(file, encoding="utf-8")
+                    print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
+                    self.list_data_dict.extend(cur_data_dict)
+        elif data_path.endswith(".yaml"):
+            with open(data_path, "r") as file:
+                yaml_data = yaml.safe_load(file)
+                datasets = yaml_data.get("datasets")
+                # file should be in the format of:
+                # datasets:
+                #   - json_path: xxxx1.json
+                #     sampling_strategy: first:1000
+                #   - json_path: xxxx2.json
+                #     sampling_strategy: end:3000
+                #   - json_path: xxxx3.json
+                #     sampling_strategy: random:999
+                data_args.dataset_paths = [dataset.get("json_path") for dataset in datasets]
+                for dataset in datasets:
+                    json_path = dataset.get("json_path")
+                    sampling_strategy = dataset.get("sampling_strategy", "all")
+                    sampling_number = None
+
+                    print(f"Loading {json_path} with {sampling_strategy} sampling strategy")
+
+                    if json_path.endswith(".jsonl"):
+                        cur_data_dict = []
+                        with open(json_path, "r", encoding="utf-8") as json_file:
+                            for line in json_file:
+                                cur_data_dict.append(json.loads(line.strip()))
+                    elif json_path.endswith(".json"):
+                        with open(json_path, "r", encoding="utf-8") as json_file:
+                            cur_data_dict = json.load(json_file)
+                    else:
+                        raise ValueError(f"Unsupported file type: {json_path}")
+
+                    if ":" in sampling_strategy:
+                        sampling_strategy, sampling_number = sampling_strategy.split(":")
+                        if "%" in sampling_number:
+                            sampling_number = math.ceil(int(sampling_number.split("%")[0]) * len(cur_data_dict) / 100)
+                        else:
+                            sampling_number = int(sampling_number)
+
+                    # Apply the sampling strategy
+                    if sampling_strategy == "first" and sampling_number is not None:
+                        cur_data_dict = cur_data_dict[:sampling_number]
+                    elif sampling_strategy == "end" and sampling_number is not None:
+                        cur_data_dict = cur_data_dict[-sampling_number:]
+                    elif sampling_strategy == "random" and sampling_number is not None:
+                        random.shuffle(cur_data_dict)
+                        cur_data_dict = cur_data_dict[:sampling_number]
+
+                    print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
+                    self.list_data_dict.extend(cur_data_dict)
+        else:
+            data_args.dataset_paths = [data_path]
+            print(f"Loading {data_path}")
+            with open(data_path, "r", encoding="utf-8") as file:
+                cur_data_dict = json.load(file)
+                print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
+                self.list_data_dict.extend(cur_data_dict)
+
+        print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
+        print("Formatting inputs...Skip in lazy mode")
+        self.tokenizer = tokenizer
+        self.data_args = data_args
+
+    def _get_item(self, i) -> Dict[str, torch.Tensor]:
+        sources = self.list_data_dict[i]
+        if isinstance(i, int):
+            sources = [sources]
+        assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+
+        if "image" in sources[0]:
+            image_file = self.list_data_dict[i]["image"]
+            if type(image_file) is list:
+                image = [self.process_image(f) for f in image_file]
+                # Handling multi images
+                # overwrite to process with simple pad
+                if len(image_file) > 1:
+                    image = [self.process_image(f, "pad") for f in image_file]
+                    image = [[im[0], im[1], "image"] for im in image]
+            else:
+                image = [self.process_image(image_file)]
+            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+
+        elif "video" in sources[0]:
+            video_file = self.list_data_dict[i]["video"]
+            video_folder = self.data_args.video_folder
+            video_file = os.path.join(video_folder, video_file)
+            suffix = video_file.split(".")[-1]
+            if not os.path.exists(video_file):
+                print("File {} not exist!".format(video_file))
+
+            try:
+                if "shareVideoGPTV" in video_file:
+                    frame_files = [os.path.join(video_file, f) for f in os.listdir(video_file) if
+                                   os.path.isfile(os.path.join(video_file, f))]
+                    frame_files.sort()  # Ensure the frames are sorted if they are named sequentially
+
+                    # TODO: Hard CODE: Determine the indices for uniformly sampling 10 frames
+                    if self.data_args.force_sample:
+                        num_frames_to_sample = self.data_args.frames_upbound
+                    else:
+                        num_frames_to_sample = 10
+
+                    avg_fps = 2
+
+                    total_frames = len(frame_files)
+                    sampled_indices = np.linspace(0, total_frames - 1, num_frames_to_sample, dtype=int)
+
+                    frame_time = [i / 2 for i in sampled_indices]
+                    frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+
+                    video_time = total_frames / avg_fps
+
+                    # Read and store the sampled frames
+                    video = []
+                    for idx in sampled_indices:
+                        frame_path = frame_files[idx]
+                        try:
+                            with Image.open(frame_path) as img:
+                                frame = img.convert("RGB")
+                                video.append(frame)
+                        except IOError:
+                            print(f"Failed to read frame at path: {frame_path}")
+                else:
+                    video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file,
+                                                                                                    self.data_args)
+
+                processor = self.data_args.image_processor
+                image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
+                if self.data_args.add_time_instruction:
+                    time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {num_frames_to_sample} frames are uniformly sampled from it. These frames are located at {frame_time}.Please answer the following questions related to this video."
+                    sources[0]["conversations"][0][
+                        "value"] = f'{DEFAULT_IMAGE_TOKEN}\n{time_instruciton}\n{sources[0]["conversations"][0]["value"].replace(DEFAULT_IMAGE_TOKEN, "")}'
+                image = [(image, video[0].size, "video")]
+                sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+                # print(sources)
+            except Exception as e:
+                print(f"Error: {e}")
+                print(f"Failed to read video file: {video_file}")
+                return self._get_item(i + 1)
+        else:
+            sources = copy.deepcopy([e["conversations"] for e in sources])
+
+        has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
+        data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
+
+        if "prompt" in data_dict:
+            prompt = data_dict["prompt"]
+        else:
+            prompt = None
+
+        if isinstance(i, int):
+            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
+
+        # image exist in the data
+        if "image" in self.list_data_dict[i]:
+            data_dict["image"] = image
+        elif "video" in self.list_data_dict[i]:
+            data_dict["image"] = image
+        elif self.data_args.is_multimodal:
+            # image does not exist in the data, but the model is multimodal
+            crop_size = self.data_args.image_processor.crop_size
+            data_dict["image"] = [
+                (torch.zeros(1, 3, crop_size["height"], crop_size["width"]), (crop_size["width"], crop_size["height"]),
+                 "text"),
+            ]
+        # prompt exist in the data
+        if prompt is not None:
+            data_dict["prompt"] = prompt
+
+        data_dict["id"] = self.list_data_dict[i].get("id", i)
+
+        return data_dict
+
+
 def train():
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, MeZOTrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # Initialize HfArgumentParser with all relevant dataclasses
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, MeZOTrainingArguments, MonitoringArguments))
+
+    # Parse all arguments into their respective dataclasses
+    model_args, data_args, training_args, monitoring_args = parser.parse_args_into_dataclasses()
 
     if training_args.verbose_logging:
         print(f"Inspecting experiment hyperparameters:\n")
         print(f"model_args = {vars(model_args)}\n")
         print(f"data_args = {vars(data_args)}\n")
         print(f"training_args = {vars(training_args)}\n")
+        print(f"monitoring_args = {vars(monitoring_args)}\n")
         # If evaluation_args exist
         # print(f"evaluation_args = {vars(evaluation_args)}\n")
 
@@ -396,13 +634,34 @@ def train():
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
 
-    trainer = MeZOLLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
-
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    if training_args.use_zo_adamu:
+        trainer = ZOAdaMULLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     else:
-        trainer.train()
-    trainer.save_state()
+        trainer = MeZOLLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+
+    monitor_process = None
+    if monitoring_args.enable_monitoring:
+        print("Monitoring is enabled. Starting GPU memory monitor...")
+        current_pid = os.getpid()
+        monitor_process = Process(target=monitor, args=(current_pid, monitoring_args.monitor_interval))
+        monitor_process.start()
+
+    try:
+        if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+            trainer.train(resume_from_checkpoint=True)
+        else:
+            trainer.train()
+        trainer.save_state()
+    except KeyboardInterrupt:
+        print("Training interrupted by user. Saving model...")
+    finally:
+        if monitor_process and monitor_process.is_alive():
+            print("Training completed. Terminating GPU memory monitor...")
+            monitor_process.terminate()
+            monitor_process.join()
+
+    print("Max GPU memory usage during training:")
+    print(f"{torch.cuda.max_memory_allocated() / (1024 ** 3):.2f} GB")
 
     model.config.use_cache = True
     save_model(model, trainer, training_args, local_rank)

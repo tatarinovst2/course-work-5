@@ -3,7 +3,6 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
-from time import perf_counter
 from typing import Optional
 
 import torch.distributed as dist
@@ -86,28 +85,12 @@ from llava.train.train import TrainingArguments
 from utils import plot_graphs_based_on_log_history
 
 
-@dataclass
-class MeZOTrainingArguments(TrainingArguments):
-    """
-    TrainingArguments is a class containing the key arguments for Trainer. It requires the following attributes:
-
-    Args:
-        trainer_mode (str): Mode of training (`regular`, `zo`).
-        zo_eps (float): MeZO hyperparameter epsilon.
-    """
-
-    trainer_mode: str = field(default="regular", metadata={"help": "Mode of training (`regular`, `zo`)."})
-    zo_eps: float = field(default=1e-3, metadata={"help": "MeZO hyperparameter epsilon."})
-    zo_num_directions: int = field(default=1, metadata={"help": "Number of directions for MeZO."})
-    use_zo_adamu: bool = field(
-        default=False,
-        metadata={
-            "help": "Use ZO-AdaMU version of MeZO. If False, the regular MeZO is used."
-        },
-    )
+def get_sign(number):
+    sign = math.copysign(1, number)
+    return int(sign)
 
 
-class MeZOLLaVATrainer(LLaVATrainer):
+class ZOAdaMULLaVATrainer(LLaVATrainer):
     def __init__(self, **kwargs):
         """
         Initialize the MeZOLLaVATrainer.
@@ -120,198 +103,138 @@ class MeZOLLaVATrainer(LLaVATrainer):
 
         args = self.args
 
+        self.hist_perturbation = {}
+        self.limit_steps = args.max_steps
+        self.warmup_steps = args.max_steps
+        self.warmup_1st_steps = 128 # 1024
+        self.warmup_2nd_steps = int(args.max_steps * 0.8)
+
         self.trainer_mode = getattr(args, "trainer_mode", "regular")
         self.zo_eps = getattr(args, "zo_eps", 1e-3)
-        self.zo_num_directions = getattr(args, "zo_num_directions", 1)
 
         print(f"MeZOLLaVATrainer initialized with mode: {self.trainer_mode}")
-        self.projected_grad = None
-        self.zo_random_seed = None
 
-        self.zo_direction_accumulator = []
-        self.zo_accumulation_count = 0
-
-        self.batch_zo_seeds = None
-
-        self.trainable_params = [(p[0], p[1]) for p in self.model.named_parameters() if p[1].requires_grad]
-
-        print(f"Trainable parameters amount: {len(self.trainable_params)}")
-
-        if not self.trainable_params:
-            raise ValueError("No trainable parameters found. Ensure the model has a trainable head or similar.")
+        self.named_parameters_to_optim = []
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.named_parameters_to_optim.append((name, param))
 
         if self.trainer_mode == "zo":
             for param in self.model.parameters():
                 param.requires_grad = False  # Ensure no accidental gradient computation
 
-        self.mezo_update_history = []
+    def _ema_weight(self, varphi):
+        if self.state.global_step < self.warmup_1st_steps:
+            lr = 1.
+        elif self.state.global_step >= self.warmup_1st_steps and self.state.global_step < self.warmup_2nd_steps:
+            lr = 0.5 * (1 + math.cos(math.pi * ((self.state.global_step - self.warmup_1st_steps) / self.limit_steps)))
+            self.limit_steps -= varphi * (self.state.max_steps - self.warmup_2nd_steps) / (self.warmup_2nd_steps - self.warmup_1st_steps)
+        else:
+            lr = 0.5 * (1 + math.cos(math.pi * ((self.warmup_2nd_steps - self.warmup_1st_steps) / self.limit_steps)))
+        return lr
 
     ########################
     # MeZO-specific Methods
     ########################
-
-    def zo_perturb_parameters(self, scaling_factor=1.0):
+    def zo_perturb_parameters(self, random_seed=None, scaling_factor=1):
         """
-        Perturb the model parameters with a random vector z.
-
-        Args:
-            scaling_factor (float): Scaling factor for the perturbation.
+        Perturb the parameters with random vector z.
+        Input:
+        - random_seed: random seed for MeZO in-place perturbation (if it's None, we will use self.zo_random_seed)
+        - scaling_factor: theta = theta + scaling_factor * z * eps
         """
-        torch.manual_seed(self.zo_random_seed)
-        for name, param in self.trainable_params:
-            z = torch.normal(
-                mean=0, std=1, size=param.data.size(),
-                device=param.device, dtype=param.dtype
-            )
-            param.data += scaling_factor * z * self.zo_eps
+
+        # Set the random seed to ensure that we sample the same z for perturbation/update
+        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+
+        std_current_step = self._ema_weight(1.0) # 1.0 added
+        for name, param in self.named_parameters_to_optim:
+            z_history = 0.9 * torch.normal(mean=self.hist_perturbation[name], std=math.sqrt(1. - std_current_step))
+            z_current = 0.1 * torch.normal(mean=0, std=math.sqrt(std_current_step), size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            z = z_history + z_current
+
+            param.data = param.data + scaling_factor * z * self.args.zo_eps
 
     def zo_forward(self, model, inputs):
         """
-        Compute the loss.
-
-        Args:
-            model (nn.Module): The model.
-            inputs (Dict): Batch of inputs.
-
-        Returns:
-            torch.Tensor: The computed loss.
+        Get (no gradient) loss from the model. Dropout is turned off too.
         """
         model.eval()
+
         with torch.inference_mode():
             inputs = self._prepare_inputs(inputs)
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
             if self.args.n_gpu > 1:
-                loss = loss.mean()
+                # Warning: this is copied from the original Huggingface Trainer. Untested.
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
         return loss.detach()
 
     def zo_step(self, model, inputs):
         """
-        Estimate the gradient using MeZO by performing multiple directional forward passes.
-
-        Args:
-            model (nn.Module): The model.
-            inputs (Dict): Batch of inputs.
-
-        Returns:
-            torch.Tensor: The loss from the first forward pass.
+        Estimate gradient by MeZO. Return the loss from f(theta + z)
         """
-        directions = []
+        args = self.args
 
-        if self.batch_zo_seeds is None:
-            self.batch_zo_seeds = [np.random.randint(1000000000) for _ in range(self.zo_num_directions)]
-            print(f"Sampled batch seeds: {self.batch_zo_seeds}")
+        if len(self.hist_perturbation) == 0:
+            for name, param in model.named_parameters():
+                self.hist_perturbation[name] = torch.zeros_like(param.data, device=param.data.device, dtype=param.data.dtype)
 
-        for seed in self.batch_zo_seeds:
-            self.zo_random_seed = seed
+        # Sample the random seed for sampling z
+        self.zo_random_seed = np.random.randint(1000000000)
 
-            self.zo_perturb_parameters(scaling_factor=1.0)
-            loss_plus = self.zo_forward(model, inputs)
+        # First function evaluation
+        self.zo_perturb_parameters(scaling_factor=1)
+        loss1 = self.zo_forward(model, inputs)
 
-            self.zo_perturb_parameters(scaling_factor=-2.0)
-            loss_minus = self.zo_forward(model, inputs)
-            print(f"Seed {seed} loss_plus: {loss_plus} loss_minus: {loss_minus}")
+        # Second function evaluation
+        self.zo_perturb_parameters(scaling_factor=-2)
+        loss2 = self.zo_forward(model, inputs)
 
-            self.zo_perturb_parameters(scaling_factor=1.0)
+        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
 
-            grad_estimate = ((loss_plus - loss_minus) / (2 * self.zo_eps)).item()
+        # No gradient accumulation support
+        assert self.args.gradient_accumulation_steps == 1
 
-            directions.append((seed, grad_estimate))
+        # Reset model back to its parameters at start of step
+        self.zo_perturb_parameters(scaling_factor=1)
 
-            update_entry = {
-                "type": "zo_step",
-                "global_step": self.state.global_step,
-                "zo_eps": self.zo_eps,
-                "seed": seed,
-            }
+        torch.cuda.empty_cache()
 
-            self.mezo_update_history.append(update_entry)
+        return loss1
 
-        self.zo_direction_accumulator.extend(directions)
-        self.zo_accumulation_count += 1
-
-        return loss_plus / (self.args.gradient_accumulation_steps * self.zo_num_directions)
-
-    def zo_update(self, learning_rate):
+    def zo_update(self, model):
         """
-        Update model parameters based on the estimated gradient.
-
-        Args:
-            learning_rate (float): The learning rate used for the update.
+        Update the parameters with the estimated gradients.
         """
-        if len(self.zo_direction_accumulator) == 0:
-            print("No accumulated directions to update.")
-            return
+        args = self.args
 
-        seed_group = {}
-        for seed, grad_estimate in self.zo_direction_accumulator:
-            if seed in seed_group:
-                seed_group[seed] += grad_estimate / (self.args.gradient_accumulation_steps * self.zo_num_directions)
+        # Reset the random seed for sampling zs
+        torch.manual_seed(self.zo_random_seed)
+
+        for name, param in self.named_parameters_to_optim:
+            # Resample z
+            # Resample z
+            std_current_step = self._ema_weight(1.0)
+            beta_1 = self._ema_weight(0.1)
+            beta_2 = self._ema_weight(1.5)
+            z_history = torch.normal(mean=self.hist_perturbation[name], std=math.sqrt(1. - std_current_step))
+            z_current = torch.normal(mean=0, std=math.sqrt(std_current_step), size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            m = beta_1 * z_current + (1 - beta_1) * z_history
+            v = beta_2 * z_current ** 2 + (1 - beta_2) * z_history ** 2
+
+            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                param.data = param.data - self._get_learning_rate() * (self.projected_grad * m / torch.sqrt(v + 1e-8) + args.weight_decay * param.data)
             else:
-                seed_group[seed] = grad_estimate / (self.args.gradient_accumulation_steps * self.zo_num_directions)
+                param.data = param.data - self._get_learning_rate() * (self.projected_grad * m / torch.sqrt(v + 1e-8))
 
-        for seed, grad_sum in seed_group.items():
-            torch.manual_seed(seed)
+            self.hist_perturbation[name] = get_sign(self.projected_grad) * m
 
-            for name, param in self.trainable_params:
-                z = torch.normal(
-                    mean=0, std=1, size=param.data.size(),
-                    device=param.device, dtype=param.dtype
-                )
-                if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-                    param.data -= learning_rate * (grad_sum * z + self.args.weight_decay * param.data)
-                else:
-                    param.data -= learning_rate * grad_sum * z
-
-        print(
-            f"Applied MeZO update with aggregated grad estimates "
-            f"from {len(self.zo_direction_accumulator)} directions "
-            f"(aggregated to {len(seed_group)} unique seeds)."
-            f"Seed group: {seed_group}")
-
-        self.zo_direction_accumulator = []
-        self.zo_accumulation_count = 0
-        self.batch_zo_seeds = None
-
-        update_entry = {
-            "type": "mezo_update",
-            "global_step": self.state.global_step,
-            "learning_rate": learning_rate,
-            "seed_group": seed_group
-        }
-
-        self.mezo_update_history.append(update_entry)
+        self.lr_scheduler.step()
 
     ########################
     # Override Methods
     ########################
-
-    def _save_mezo_state(self, output_dir: str):
-        """
-        Save the MeZO state checkpoint that includes the noise seeds and the accumulated grad estimates.
-        """
-        mezo_state = {
-            "weight_decay": self.args.weight_decay,
-            "zo_eps": self.zo_eps,
-            "zo_num_directions": self.zo_num_directions,
-            "trainable_params_names": [name for name, _ in self.trainable_params],
-            "trainable_params_sizes": {name: param.size() for name, param in self.trainable_params},
-            "update_history": self.mezo_update_history
-        }
-        mezo_checkpoint_path = os.path.join(output_dir, "mezo_state.pt")
-        torch.save(mezo_state, mezo_checkpoint_path)
-        print(f"MeZO checkpoint saved at {mezo_checkpoint_path}")
-
-    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
-        """
-        Override the save_model method to also store the lightweight MeZO checkpoint.
-        """
-        ret = super().save_model(output_dir, _internal_call)
-
-        if self.trainer_mode == "zo":
-            output_dir = output_dir if output_dir is not None else self.args.output_dir
-            self._save_mezo_state(output_dir)
-        return ret
 
     def create_optimizer(self):
         """
@@ -689,7 +612,6 @@ class MeZOLLaVATrainer(LLaVATrainer):
                         tr_loss_step = self.training_step(model, inputs)
                         print(f"Step {step} loss: {tr_loss_step}")
 
-                torch.cuda.empty_cache()  # Releasing reserved memory seems not to work correctly, so do it manually
                 ########################
                 # End of MeZO Integration
                 ########################
@@ -725,7 +647,7 @@ class MeZOLLaVATrainer(LLaVATrainer):
                     # MeZO Integration
                     ########################
                     if self.trainer_mode == "zo":
-                        self.zo_update(learning_rate=self._get_learning_rate())
+                        self.zo_update(model)
                         self.lr_scheduler.step()
                     ########################
                     # End of MeZO Integration
@@ -790,7 +712,6 @@ class MeZOLLaVATrainer(LLaVATrainer):
                     if is_torch_xla_available():
                         xm.mark_step()
                     break
-
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
