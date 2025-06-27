@@ -1,9 +1,9 @@
 name: "Check Pull Request Readiness"
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
+#  push:  # Stop for now
+#    branches: [ main ]
+#  pull_request:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.ref }}
